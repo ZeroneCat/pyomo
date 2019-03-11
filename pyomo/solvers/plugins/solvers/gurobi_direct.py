@@ -11,23 +11,21 @@
 import logging
 import re
 import sys
-import pyomo.common
+import pyutilib.services
 from pyutilib.misc import Bunch
-from pyutilib.services import TempfileManager
-from pyomo.core.expr.numvalue import is_fixed
-from pyomo.core.expr.numvalue import value
-from pyomo.repn import generate_standard_repn
+from pyomo.util.plugin import alias
+from pyomo.core.kernel.numvalue import is_fixed
+from pyomo.repn import generate_canonical_repn, LinearCanonicalRepn, canonical_degree
 from pyomo.solvers.plugins.solvers.direct_solver import DirectSolver
 from pyomo.solvers.plugins.solvers.direct_or_persistent_solver import DirectOrPersistentSolver
-from pyomo.core.kernel.objective import minimize, maximize
+from pyomo.core.kernel.numvalue import value
+import pyomo.core.kernel
 from pyomo.core.kernel.component_set import ComponentSet
 from pyomo.core.kernel.component_map import ComponentMap
 from pyomo.opt.results.results_ import SolverResults
 from pyomo.opt.results.solution import Solution, SolutionStatus
 from pyomo.opt.results.solver import TerminationCondition, SolverStatus
-from pyomo.opt.base import SolverFactory
 from pyomo.core.base.suffix import Suffix
-import pyomo.core.base.var
 
 
 logger = logging.getLogger('pyomo.solvers')
@@ -43,8 +41,8 @@ def _is_numeric(x):
         return False
     return True
 
-@SolverFactory.register('gurobi_direct', doc='Direct python interface to Gurobi')
 class GurobiDirect(DirectSolver):
+    alias('gurobi_direct', doc='Direct python interface to Gurobi')
 
     def __init__(self, **kwds):
         kwds['type'] = 'gurobi_direct'
@@ -99,7 +97,7 @@ class GurobiDirect(DirectSolver):
             self._capabilities.quadratic_constraint = False
 
     def _apply_solver(self):
-        if not self._save_results:
+        if not self._save_results: #_save_results==False
             for block in self._pyomo_model.block_data_objects(descend_into=True,
                                                               active=True):
                 for var in block.component_data_objects(ctype=pyomo.core.base.var.Var,
@@ -108,7 +106,7 @@ class GurobiDirect(DirectSolver):
                                                         sort=False):
                     var.stale = True
         if self._tee:
-            self._solver_model.setParam('OutputFlag', 1)
+            self._solver_model.setParam('OutputFlag', 1) #OutputFlag: solver output
         else:
             self._solver_model.setParam('OutputFlag', 0)
 
@@ -153,7 +151,10 @@ class GurobiDirect(DirectSolver):
         if self._version_major >= 5:
             for suffix in self._suffixes:
                 if re.match(suffix, "dual"):
-                    self._solver_model.setParam(self._gurobipy.GRB.Param.QCPDual, 1)
+                    if self._solver_model.IsQCP:
+                        self._solver_model.setParam(self._gurobipy.GRB.Param.QCPDual, 1)
+                if re.match(suffix, "unbdRay"):
+                    self._solver_model.setParam(self._gurobipy.GRB.Param.InfUnbdInfo, 1)
 
         self._solver_model.optimize()
 
@@ -165,31 +166,43 @@ class GurobiDirect(DirectSolver):
     def _get_expr_from_pyomo_repn(self, repn, max_degree=2):
         referenced_vars = ComponentSet()
 
-        degree = repn.polynomial_degree()
+        degree = canonical_degree(repn)
         if (degree is None) or (degree > max_degree):
             raise DegreeError('GurobiDirect does not support expressions of degree {0}.'.format(degree))
 
-        if len(repn.linear_vars) > 0:
-            referenced_vars.update(repn.linear_vars)
-            new_expr = self._gurobipy.LinExpr(repn.linear_coefs, [self._pyomo_var_to_solver_var_map[i] for i in repn.linear_vars])
+        if isinstance(repn, LinearCanonicalRepn):
+            if (repn.linear is not None) and (len(repn.linear) > 0):
+                list(map(referenced_vars.add, repn.variables))
+                new_expr = self._gurobipy.LinExpr(repn.linear, [self._pyomo_var_to_solver_var_map[i] for i in repn.variables])
+            else:
+                new_expr = 0
+
+            if repn.constant is not None:
+                new_expr += repn.constant
+
         else:
-            new_expr = 0.0
+            new_expr = 0
+            if 0 in repn:
+                new_expr += repn[0][None]
 
-        for i,v in enumerate(repn.quadratic_vars):
-            x,y = v
-            new_expr += repn.quadratic_coefs[i] * self._pyomo_var_to_solver_var_map[x] * self._pyomo_var_to_solver_var_map[y]
-            referenced_vars.add(x)
-            referenced_vars.add(y)
+            if 1 in repn:
+                for ndx, coeff in repn[1].items():
+                    new_expr += coeff * self._pyomo_var_to_solver_var_map[repn[-1][ndx]]
+                    referenced_vars.add(repn[-1][ndx])
 
-        new_expr += repn.constant
+            if 2 in repn:
+                for key, coeff in repn[2].items():
+                    tmp_expr = coeff
+                    for ndx, power in key.items():
+                        referenced_vars.add(repn[-1][ndx])
+                        for i in range(power):
+                            tmp_expr *= self._pyomo_var_to_solver_var_map[repn[-1][ndx]]
+                    new_expr += tmp_expr
 
         return new_expr, referenced_vars
 
     def _get_expr_from_pyomo_expr(self, expr, max_degree=2):
-        if max_degree == 2:
-            repn = generate_standard_repn(expr, quadratic=True)
-        else:
-            repn = generate_standard_repn(expr, quadratic=False)
+        repn = generate_canonical_repn(expr)
 
         try:
             gurobi_expr, referenced_vars = self._get_expr_from_pyomo_repn(repn, max_degree)
@@ -276,10 +289,10 @@ class GurobiDirect(DirectSolver):
             gurobi_expr, referenced_vars = self._get_expr_from_pyomo_repn(
                 con.canonical_form(),
                 self._max_constraint_degree)
-        #elif isinstance(con, LinearCanonicalRepn):
-        #    gurobi_expr, referenced_vars = self._get_expr_from_pyomo_repn(
-        #        con,
-        #        self._max_constraint_degree)
+        elif isinstance(con, LinearCanonicalRepn):
+            gurobi_expr, referenced_vars = self._get_expr_from_pyomo_repn(
+                con,
+                self._max_constraint_degree)
         else:
             gurobi_expr, referenced_vars = self._get_expr_from_pyomo_expr(
                 con.body,
@@ -387,9 +400,9 @@ class GurobiDirect(DirectSolver):
         if obj.active is False:
             raise ValueError('Cannot add inactive objective to solver.')
 
-        if obj.sense == minimize:
+        if obj.sense == pyomo.core.kernel.minimize:
             sense = self._gurobipy.GRB.MINIMIZE
-        elif obj.sense == maximize:
+        elif obj.sense == pyomo.core.kernel.maximize:
             sense = self._gurobipy.GRB.MAXIMIZE
         else:
             raise ValueError('Objective sense is not recognized: {0}'.format(obj.sense))
@@ -412,6 +425,7 @@ class GurobiDirect(DirectSolver):
         extract_duals = False
         extract_slacks = False
         extract_reduced_costs = False
+        extract_unbounded_ray = False
         for suffix in self._suffixes:
             flag = False
             if re.match(suffix, "dual"):
@@ -422,6 +436,9 @@ class GurobiDirect(DirectSolver):
                 flag = True
             if re.match(suffix, "rc"):
                 extract_reduced_costs = True
+                flag = True
+            if re.match(suffix, "unbdRay"):
+                extract_unbounded_ray = True
                 flag = True
             if not flag:
                 raise RuntimeError("***The gurobi_direct solver plugin cannot extract solution suffix="+suffix)
@@ -435,14 +452,17 @@ class GurobiDirect(DirectSolver):
                 logger.warning("Cannot get reduced costs for MIP.")
             if extract_duals:
                 logger.warning("Cannot get duals for MIP.")
+            if extract_unbounded_ray:
+                logger.warning("Cannot get unbounded ray for MIP.")
             extract_reduced_costs = False
             extract_duals = False
+            extract_unbounded_ray = False
 
         self.results = SolverResults()
         soln = Solution()
 
         self.results.solver.name = self._name
-        self.results.solver.wallclock_time = gprob.Runtime
+        self.results.solver.wallclock_time = gprob.Runtime #Note that all times reported by the Gurobi Optimizer are wall-clock times.
 
         if status == grb.LOADED:  # problem is loaded, but no solution
             self.results.solver.status = SolverStatus.aborted
@@ -541,9 +561,9 @@ class GurobiDirect(DirectSolver):
         self.results.problem.name = gprob.ModelName
 
         if gprob.ModelSense == 1:
-            self.results.problem.sense = minimize
+            self.results.problem.sense = pyomo.core.kernel.minimize
         elif gprob.ModelSense == -1:
-            self.results.problem.sense = maximize
+            self.results.problem.sense = pyomo.core.kernel.maximize
         else:
             raise RuntimeError('Unrecognized gurobi objective sense: {0}'.format(gprob.ModelSense))
 
@@ -619,6 +639,7 @@ class GurobiDirect(DirectSolver):
                         if self._referenced_variables[pyomo_var] > 0:
                             soln_variables[name]["Rc"] = val
 
+
                 if extract_duals or extract_slacks:
                     gurobi_cons = self._solver_model.getConstrs()
                     con_names = self._solver_model.getAttr("ConstrName", gurobi_cons)
@@ -662,6 +683,27 @@ class GurobiDirect(DirectSolver):
                         q_vals = self._solver_model.getAttr("QCSlack", gurobi_q_cons)
                         for val, name in zip(q_vals, q_con_names):
                             soln_constraints[name]["Slack"] = val
+
+            else:
+                if extract_unbounded_ray:
+                    soln_variables = soln.variable
+                    gurobi_vars = self._solver_model.getVars()
+                    gurobi_vars = list(set(gurobi_vars).intersection(set(self._pyomo_var_to_solver_var_map.values())))
+                    var_vals = self._solver_model.getAttr("X", gurobi_vars)
+                    names = self._solver_model.getAttr("VarName", gurobi_vars)
+                    for gurobi_var, val, name in zip(gurobi_vars, var_vals, names):
+                        pyomo_var = self._solver_var_to_pyomo_var_map[gurobi_var]
+                        if self._referenced_variables[pyomo_var] > 0:
+                            pyomo_var.stale = False
+                            soln_variables[name] = {"Value": val}
+
+
+                    vals = self._solver_model.getAttr("UnbdRay", gurobi_vars)
+                    for gurobi_var, val, name in zip(gurobi_vars, vals, names):
+                        pyomo_var = self._solver_var_to_pyomo_var_map[gurobi_var]
+                        if self._referenced_variables[pyomo_var] > 0:
+                            soln_variables[name]["UnbdRay"] = val
+
         elif self._load_solutions:
             if gprob.SolCount > 0:
 
@@ -676,11 +718,14 @@ class GurobiDirect(DirectSolver):
                 if extract_slacks:
                     self._load_slacks()
 
+            elif extract_unbounded_ray:
+                self._load_UnbdRay()
+
         self.results.solution.insert(soln)
 
         # finally, clean any temporary files registered with the temp file
         # manager, created populated *directly* by this plugin.
-        TempfileManager.pop(remove=not self._keepfiles)
+        pyutilib.services.TempfileManager.pop(remove=not self._keepfiles)
 
         return DirectOrPersistentSolver._postsolve(self)
 
@@ -721,6 +766,22 @@ class GurobiDirect(DirectSolver):
         for var, val in zip(vars_to_load, vals):
             if ref_vars[var] > 0:
                 rc[var] = val
+
+    def _load_UnbdRay(self, vars_to_load=None):
+        if not hasattr(self._pyomo_model, 'UnbdRay'):
+            self._pyomo_model.UnbdRay = Suffix(direction=Suffix.IMPORT)
+        var_map = self._pyomo_var_to_solver_var_map
+        ref_vars = self._referenced_variables
+        UnbdRay = self._pyomo_model.UnbdRay
+        if vars_to_load is None:
+            vars_to_load = var_map.keys()
+
+        gurobi_vars_to_load = [var_map[pyomo_var] for pyomo_var in vars_to_load]
+        vals = self._solver_model.getAttr("UnbdRay", gurobi_vars_to_load)
+
+        for var, val in zip(vars_to_load, vals):
+            if ref_vars[var] > 0:
+                UnbdRay[var] = val
 
     def _load_duals(self, cons_to_load=None):
         if not hasattr(self._pyomo_model, 'dual'):
@@ -812,6 +873,9 @@ class GurobiDirect(DirectSolver):
         vars_to_load: list of Var
         """
         self._load_rc(vars_to_load)
+
+    def load_UnbdRay(self, vars_to_load):
+        self._load_UnbdRay(vars_to_load)
 
     def load_slacks(self, cons_to_load=None):
         """
